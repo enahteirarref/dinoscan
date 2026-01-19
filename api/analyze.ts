@@ -2,7 +2,11 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 const PROMPT =
-  '你是一位资深的古生物学家。请识别这张照片中的恐龙化石或骨骼。即使照片略有模糊或光线不足，也请基于可见特征给出最可能的专业推测。请提供：1.中文名称 2.地质年代 3.分类 4.预估长度 5.稀有度（普通、稀有、或传说） 6.置信度(0-100) 7.一段2句简短的专业笔记。请务必使用简体中文回答。以 JSON 格式返回: { "Name": "名称", "Era": "年代", "Classification": "分类", "Length": "长度", "Rarity": "稀有度", "Confidence": 95, "Note": "笔记内容" }';
+  '你是一位资深的古生物学家。请识别这张照片中的恐龙化石或骨骼。' +
+  '请严格遵守：不要输出推理过程，不要输出任何解释文字，只输出 JSON。' +
+  '即使模糊/光线不足，也要给出最可能推测。' +
+  'JSON 格式必须完全如下字段：' +
+  '{ "Name":"名称","Era":"年代","Classification":"分类","Length":"长度","Rarity":"普通/稀有/传说","Confidence":95,"Note":"两句简短专业笔记" }';
 
 function setCors(res: VercelResponse) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -11,14 +15,10 @@ function setCors(res: VercelResponse) {
 }
 
 function normalizeArkBase(input?: string) {
-  // 允许你传：
-  // 1) https://ark.cn-beijing.volces.com
-  // 2) https://ark.cn-beijing.volces.com/api/v3
   const base = (input || "https://ark.cn-beijing.volces.com").replace(/\/+$/, "");
   return base.endsWith("/api/v3") ? base : `${base}/api/v3`;
 }
 
-/** 读取 JSON（兼容 Vercel 是否自动解析 req.body） */
 async function readJson(req: VercelRequest) {
   if (req.body && typeof req.body === "object") return req.body;
 
@@ -28,21 +28,17 @@ async function readJson(req: VercelRequest) {
   for await (const chunk of req) {
     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     total += buf.length;
-    // 提前拦截：避免上传过大导致函数直接崩
     if (total > 4.2 * 1024 * 1024) throw new Error("REQUEST_TOO_LARGE");
     chunks.push(buf);
   }
-
   const raw = Buffer.concat(chunks).toString("utf8");
   return JSON.parse(raw || "{}");
 }
 
-/** 粗略估算 base64 字节数 */
 function base64Bytes(b64: string) {
   return Math.floor((b64.length * 3) / 4);
 }
 
-/** 从模型输出里提取 JSON（兼容“前后夹杂说明文字”的情况） */
 function extractJson(text: string) {
   const t = (text || "").trim();
   try {
@@ -54,33 +50,36 @@ function extractJson(text: string) {
   }
 }
 
-/** 尽可能从 Ark 的 responses/chat 返回体里拿到文本 */
-function pickModelText(obj: any): string {
-  // 兼容 OpenAI chat/completions 风格
-  const c = obj?.choices?.[0]?.message?.content;
-  if (typeof c === "string" && c.trim()) return c;
+/**
+ * 从 Responses API 返回体里尽量拿到可用文本。
+ * 优先取最终回答（message/content），没有就退到 reasoning summary。
+ */
+function pickAnyText(up: any): string {
+  const out = up?.output;
+  if (!Array.isArray(out)) return "";
 
-  // 兼容 responses 风格：output[].content[].text
-  const out = obj?.output;
-  if (Array.isArray(out)) {
-    const parts: string[] = [];
-    for (const o of out) {
-      const content = o?.content;
-      if (Array.isArray(content)) {
-        for (const p of content) {
-          if (typeof p?.text === "string" && p.text.trim()) parts.push(p.text);
-          if (typeof p?.content === "string" && p.content.trim()) parts.push(p.content);
-        }
+  const texts: string[] = [];
+
+  for (const o of out) {
+    // 常见：type="message" content=[{type:"output_text",text:"..."}]
+    const content = o?.content;
+    if (Array.isArray(content)) {
+      for (const c of content) {
+        if (typeof c?.text === "string" && c.text.trim()) texts.push(c.text);
+        if (typeof c?.content === "string" && c.content.trim()) texts.push(c.content);
       }
     }
-    if (parts.length) return parts.join("\n");
+
+    // 你这次拿到的是：type="reasoning" summary=[{type:"summary_text",text:"..."}]
+    const summary = o?.summary;
+    if (Array.isArray(summary)) {
+      for (const s of summary) {
+        if (typeof s?.text === "string" && s.text.trim()) texts.push(s.text);
+      }
+    }
   }
 
-  // 兜底
-  if (typeof obj?.output_text === "string") return obj.output_text;
-  if (typeof obj?.text === "string") return obj.text;
-
-  return "";
+  return texts.join("\n").trim();
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -90,13 +89,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
 
   const ARK_API_KEY = process.env.ARK_API_KEY;
-  const ARK_MODEL = process.env.ARK_MODEL; // 例如 doubao-seed-1-6-vision-250815
+  const ARK_MODEL = process.env.ARK_MODEL;
   const ARK_BASE = normalizeArkBase(process.env.ARK_BASE_URL);
 
   if (!ARK_API_KEY || !ARK_MODEL) {
     return res.status(500).json({
       error: "Missing env",
-      detail: "请在 Vercel Environment Variables 配置 ARK_API_KEY 与 ARK_MODEL（Production 环境也要配）。",
+      detail: "请在 Vercel Environment Variables 配置 ARK_API_KEY 与 ARK_MODEL（Production 也要配），并重新部署。",
     });
   }
 
@@ -105,10 +104,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     body = await readJson(req);
   } catch (e: any) {
     if (e?.message === "REQUEST_TOO_LARGE") {
-      return res.status(413).json({
-        error: "Payload too large",
-        detail: "你传到 /api/analyze 的 base64 过大，超过函数可承受范围。请在前端压缩/降分辨率后再传。",
-      });
+      return res.status(413).json({ error: "Payload too large", detail: "base64 过大，请前端压缩图片后再传。" });
     }
     return res.status(400).json({ error: "Bad JSON", detail: String(e?.message || e) });
   }
@@ -118,41 +114,38 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   if (!imageBase64) return res.status(400).json({ error: "Missing imageBase64" });
 
-  // 建议更保守：<= 1.5MB 更稳（Vercel + 跨境调用）
   const imgBytes = base64Bytes(imageBase64);
   if (imgBytes > 1.8 * 1024 * 1024) {
     return res.status(413).json({
       error: "Image too large",
-      detail: `图片约 ${(imgBytes / 1024 / 1024).toFixed(2)}MB。请把截图分辨率/质量再降一点（建议 <= 1.5MB）。`,
+      detail: `图片约 ${(imgBytes / 1024 / 1024).toFixed(2)}MB，建议 <= 1.5MB。`,
     });
   }
 
-  // 用官方示例同款 Responses API：/api/v3/responses
   const upstreamUrl = `${ARK_BASE}/responses`;
 
-  // 超时控制：避免 Vercel 卡死变 502
   const controller = new AbortController();
-  const timeoutMs = 18_000; // 你配了 maxDuration 后可适当加大
+  const timeoutMs = 25_000;
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const payload = {
       model: ARK_MODEL,
+      // 强约束：不要推理，只输出 JSON（避免 reasoning 吃满 token）
       input: [
         {
           role: "user",
           content: [
-            {
-              type: "input_image",
-              // data URL 方式：避免你还要先把图片传到公网
-              image_url: `data:${mimeType};base64,${imageBase64}`,
-            },
+            { type: "input_image", image_url: `data:${mimeType};base64,${imageBase64}` },
             { type: "input_text", text: PROMPT },
           ],
         },
       ],
       temperature: 0.2,
-      max_output_tokens: 700,
+      // 你之前 700 完全被 reasoning 吃掉了，这里提高一些
+      max_output_tokens: 1200,
+      // 如果 Ark 支持该字段，可进一步降低推理（不支持也没关系）
+      // reasoning: { effort: "low" }
     };
 
     const upstream = await fetch(upstreamUrl, {
@@ -168,15 +161,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const rawText = await upstream.text();
 
-    // 关键：把 Ark 的真实错误透传回前端（你就不会只看到 500/502 了）
     if (!upstream.ok) {
-      console.error("[ARK_UPSTREAM_ERROR]", upstream.status, rawText.slice(0, 1200));
       return res.status(502).json({
         error: "Upstream Ark error",
         upstreamStatus: upstream.status,
         upstreamBody: rawText.slice(0, 2000),
-        hint:
-          "常见原因：ARK_MODEL 写错/没开通；Key 权限或余额；跨区域超时。请先看 upstreamBody 的真实报错内容。",
       });
     }
 
@@ -184,37 +173,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     try {
       upstreamJson = JSON.parse(rawText || "{}");
     } catch {
-      // 如果 Ark 返回了非 JSON（理论上不该），直接把原文吐回去方便你排查
-      console.error("[ARK_NON_JSON]", rawText.slice(0, 1200));
-      return res.status(502).json({
-        error: "Ark returned non-JSON",
-        upstreamBody: rawText.slice(0, 2000),
-      });
+      return res.status(502).json({ error: "Ark returned non-JSON", upstreamBody: rawText.slice(0, 2000) });
     }
 
-    const modelText = pickModelText(upstreamJson);
-    if (!modelText) {
-      console.error("[ARK_EMPTY_TEXT]", JSON.stringify(upstreamJson).slice(0, 1200));
+    const anyText = pickAnyText(upstreamJson);
+    if (!anyText) {
       return res.status(502).json({
         error: "Empty model text",
-        detail: "Ark 返回体里没拿到文本字段（可能字段结构变化或被安全策略拦截）。",
+        detail: "Ark 返回体里没拿到文本字段（可能被截断/字段结构变化）。",
         upstream: upstreamJson,
       });
     }
 
-    // 让模型输出 JSON；如果夹杂文字，就用 extractJson 抠出来
-    const data = extractJson(modelText);
-
+    const data = extractJson(anyText);
     return res.status(200).json(data);
   } catch (e: any) {
     const msg = e?.name === "AbortError" ? `Timeout after ${timeoutMs}ms` : String(e?.message || e);
-    console.error("[ANALYZE_FATAL]", msg);
-    return res.status(502).json({
-      error: "Function failed",
-      detail: msg,
-      hint:
-        "如果是 Timeout，多半是 Vercel(美国) → 北京 Ark 跨境延迟导致。按下面第 3 步把 regions 切到亚洲通常立刻改善。",
-    });
+    return res.status(502).json({ error: "Function failed", detail: msg });
   } finally {
     clearTimeout(timer);
   }
