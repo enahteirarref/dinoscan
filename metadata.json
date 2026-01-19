@@ -1,0 +1,8 @@
+{
+  "name": "DinoScan AI Fossil Identification",
+  "description": "An advanced AI-powered application for identifying dinosaur fossils and building a personal prehistoric museum.",
+  "requestFramePermissions": [
+    "camera",
+    "geolocation"
+  ]
+}
