@@ -81,16 +81,58 @@ function assertLooksLikeImageBase64(b64: string) {
 }
 
 function extractJson(text: string) {
-  const t = (text || "").trim();
-  try {
-    return JSON.parse(t);
-  } catch {
-    // 容错：截取第一个 {...}（尽量小心）
-    const m = t.match(/\{[\s\S]*\}/);
-    if (m) return JSON.parse(m[0]);
-    throw new Error("MODEL_NOT_JSON: " + t.slice(0, 240));
+  const raw = (text || "").trim().replace(/^\uFEFF/, "");
+
+  // 先处理 ```json ... ``` 这种包裹
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  const s = (fenced ? fenced[1] : raw).trim();
+
+  const start = s.indexOf("{");
+  if (start < 0) {
+    throw new Error("MODEL_NOT_JSON: " + s.slice(0, 240));
   }
+
+  // 从第一个 { 开始，用大括号深度找“第一个完整 JSON 对象”
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+
+    if (inStr) {
+      if (esc) {
+        esc = false;
+        continue;
+      }
+      if (ch === "\\") {
+        esc = true;
+        continue;
+      }
+      if (ch === '"') {
+        inStr = false;
+        continue;
+      }
+      continue;
+    } else {
+      if (ch === '"') {
+        inStr = true;
+        continue;
+      }
+      if (ch === "{") depth++;
+      if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          const candidate = s.slice(start, i + 1);
+          return JSON.parse(candidate);
+        }
+      }
+    }
+  }
+
+  throw new Error("MODEL_JSON_UNTERMINATED: " + s.slice(start, start + 240));
 }
+
 
 /**
  * 从 Ark Responses API 返回体里尽量拿到可用文本。
