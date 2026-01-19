@@ -12,52 +12,187 @@ const CameraScanner: React.FC<CameraScannerProps> = ({ onBack, onResult }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [stream, setStream] = useState<MediaStream | null>(null);
 
-  // Initialize camera
+  // 用 ref 保证 cleanup 时能拿到最新 stream，避免旧闭包导致不 stop
+  const streamRef = useRef<MediaStream | null>(null);
+
+  // ---------- Camera setup ----------
   useEffect(() => {
+    let mounted = true;
+
     async function setupCamera() {
       try {
         const s = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+          video: {
+            facingMode: "environment",
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
           audio: false,
         });
-        setStream(s);
+
+        if (!mounted) {
+          s.getTracks().forEach((t) => t.stop());
+          return;
+        }
+
+        streamRef.current = s;
         if (videoRef.current) videoRef.current.srcObject = s;
       } catch (err) {
         console.error("Error accessing camera:", err);
         alert("无法访问摄像头，请确保已授予权限，并使用 HTTPS 访问。");
       }
     }
+
     setupCamera();
 
     return () => {
-      if (stream) stream.getTracks().forEach((t) => t.stop());
+      mounted = false;
+      const s = streamRef.current;
+      if (s) s.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // ---------- Utils ----------
   function approxBase64Bytes(b64: string) {
+    // base64 大小估算：len * 3/4（忽略 padding）
     return Math.floor((b64.length * 3) / 4);
   }
 
-  function captureCompressed(maxDim: number, quality: number) {
-    const video = videoRef.current!;
+  function dataUrlToBase64(dataUrl: string) {
+    return dataUrl.split(",")[1] || "";
+  }
+
+  function readFileAsDataURL(file: File) {
+    return new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error("FileReader failed"));
+      reader.onloadend = () => resolve(String(reader.result || ""));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  /**
+   * 把 canvas 内容导出为 jpeg base64（可控制最大边长/质量）
+   */
+  function canvasToJpegBase64(maxDim: number, quality: number, sourceW: number, sourceH: number, draw: () => void) {
     const canvas = canvasRef.current!;
     const ctx = canvas.getContext("2d")!;
 
+    const scale = Math.min(1, maxDim / Math.max(sourceW, sourceH));
+    canvas.width = Math.round(sourceW * scale);
+    canvas.height = Math.round(sourceH * scale);
+
+    // 先清空再绘制，避免残影
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    draw();
+
+    const dataUrl = canvas.toDataURL("image/jpeg", quality);
+    return { dataUrl, base64: dataUrlToBase64(dataUrl), width: canvas.width, height: canvas.height };
+  }
+
+  /**
+   * 从 video 截图并自动压缩到目标大小（bytesLimit）
+   * - 会逐步降低 maxDim 与 quality，直到 base64Bytes <= bytesLimit
+   */
+  function captureFromVideoAutoCompress(bytesLimit: number) {
+    const video = videoRef.current!;
     const vw = video.videoWidth;
     const vh = video.videoHeight;
 
-    const scale = Math.min(1, maxDim / Math.max(vw, vh));
-    canvas.width = Math.round(vw * scale);
-    canvas.height = Math.round(vh * scale);
+    // 从更高质量开始，逐步兜底
+    const attempts: Array<{ maxDim: number; quality: number }> = [
+      { maxDim: 1280, quality: 0.75 },
+      { maxDim: 1024, quality: 0.70 },
+      { maxDim: 900, quality: 0.65 },
+      { maxDim: 800, quality: 0.62 },
+      { maxDim: 720, quality: 0.60 },
+      { maxDim: 640, quality: 0.58 },
+      { maxDim: 560, quality: 0.56 },
+      { maxDim: 512, quality: 0.54 },
+      { maxDim: 480, quality: 0.52 },
+      { maxDim: 420, quality: 0.50 },
+    ];
 
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const dataUrl = canvas.toDataURL("image/jpeg", quality);
-    return { dataUrl, base64: dataUrl.split(",")[1] };
+    let best: { dataUrl: string; base64: string; bytes: number } | null = null;
+
+    for (const a of attempts) {
+      const { dataUrl, base64 } = canvasToJpegBase64(a.maxDim, a.quality, vw, vh, () => {
+        const canvas = canvasRef.current!;
+        const ctx = canvas.getContext("2d")!;
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      });
+      const bytes = approxBase64Bytes(base64);
+      best = { dataUrl, base64, bytes };
+      if (bytes <= bytesLimit) break;
+    }
+
+    // best 一定有值
+    return best!;
   }
 
+  /**
+   * 把上传图片（File）压缩到目标大小（bytesLimit）
+   * - 解码成 Image 后绘制到 canvas，再导出 jpeg base64
+   */
+  async function compressFileToJpegBase64(file: File, bytesLimit: number) {
+    const dataUrl = await readFileAsDataURL(file);
+
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error("Image decode failed"));
+      image.src = dataUrl;
+    });
+
+    const iw = img.naturalWidth || img.width;
+    const ih = img.naturalHeight || img.height;
+
+    const attempts: Array<{ maxDim: number; quality: number }> = [
+      { maxDim: 1600, quality: 0.78 },
+      { maxDim: 1400, quality: 0.74 },
+      { maxDim: 1200, quality: 0.70 },
+      { maxDim: 1024, quality: 0.68 },
+      { maxDim: 900, quality: 0.64 },
+      { maxDim: 800, quality: 0.62 },
+      { maxDim: 720, quality: 0.60 },
+      { maxDim: 640, quality: 0.58 },
+      { maxDim: 560, quality: 0.56 },
+      { maxDim: 512, quality: 0.54 },
+      { maxDim: 480, quality: 0.52 },
+    ];
+
+    let best: { dataUrl: string; base64: string; bytes: number } | null = null;
+
+    for (const a of attempts) {
+      const { dataUrl: outUrl, base64 } = canvasToJpegBase64(a.maxDim, a.quality, iw, ih, () => {
+        const canvas = canvasRef.current!;
+        const ctx = canvas.getContext("2d")!;
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      });
+      const bytes = approxBase64Bytes(base64);
+      best = { dataUrl: outUrl, base64, bytes };
+      if (bytes <= bytesLimit) break;
+    }
+
+    return best!;
+  }
+
+  async function safeReadErrorText(resp: Response) {
+    const ct = resp.headers.get("content-type") || "";
+    try {
+      if (ct.includes("application/json")) {
+        const j = await resp.json();
+        return JSON.stringify(j);
+      }
+      return await resp.text();
+    } catch {
+      return "(failed to read upstream error body)";
+    }
+  }
+
+  // ---------- Core ----------
   const processImage = async (base64Data: string, imageUrl: string) => {
     setIsScanning(true);
     try {
@@ -71,7 +206,7 @@ const CameraScanner: React.FC<CameraScannerProps> = ({ onBack, onResult }) => {
       });
 
       if (!resp.ok) {
-        const text = await resp.text();
+        const text = await safeReadErrorText(resp);
         throw new Error(`API ${resp.status}: ${text}`);
       }
 
@@ -117,30 +252,51 @@ const CameraScanner: React.FC<CameraScannerProps> = ({ onBack, onResult }) => {
   const handleCapture = async () => {
     if (!videoRef.current || !canvasRef.current) return;
 
-    // 第一次压缩：640px / 0.6
-    let { dataUrl, base64 } = captureCompressed(640, 0.6);
+    // 这里建议比后端 1.8MB 更低一些，避免 base64 膨胀导致 Vercel 平台层 413
+    const BYTES_LIMIT = 1_200_000; // 约 1.2MB，更稳
 
-    // 兜底再压一次：512px / 0.55（避免 413）
-    const bytes = approxBase64Bytes(base64);
-    if (bytes > 1.8 * 1024 * 1024) {
-      ({ dataUrl, base64 } = captureCompressed(512, 0.55));
+    try {
+      const { dataUrl, base64, bytes } = captureFromVideoAutoCompress(BYTES_LIMIT);
+      console.log("[capture] compressed bytes:", bytes);
+
+      // 如果仍然偏大，给用户更明确提示（理论上不会）
+      if (bytes > BYTES_LIMIT) {
+        alert(`图片仍然偏大（约 ${(bytes / 1024 / 1024).toFixed(2)}MB），请靠近拍摄或切换相册图片后再试。`);
+        return;
+      }
+
+      await processImage(base64, dataUrl);
+    } catch (e: any) {
+      console.error(e);
+      alert("拍摄失败：\n\n" + String(e?.message || e));
     }
-
-    processImage(base64, dataUrl);
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    // 直接把上传图片读成 base64（建议你后续也做压缩，这里先最小改动）
-    const reader = new FileReader();
-    reader.onloadend = async () => {
-      const dataUrl = reader.result as string;
-      const base64 = dataUrl.split(",")[1];
-      processImage(base64, dataUrl);
-    };
-    reader.readAsDataURL(file);
+    // 允许同一张图重复选择触发 onChange
+    e.target.value = "";
+
+    const BYTES_LIMIT = 1_200_000;
+
+    try {
+      if (!canvasRef.current) throw new Error("canvas not ready");
+
+      const { dataUrl, base64, bytes } = await compressFileToJpegBase64(file, BYTES_LIMIT);
+      console.log("[upload] compressed bytes:", bytes);
+
+      if (bytes > BYTES_LIMIT) {
+        alert(`图片压缩后仍偏大（约 ${(bytes / 1024 / 1024).toFixed(2)}MB）。请换一张更小的图片或截图后再上传。`);
+        return;
+      }
+
+      await processImage(base64, dataUrl);
+    } catch (e2: any) {
+      console.error(e2);
+      alert("上传解析失败：\n\n" + String(e2?.message || e2));
+    }
   };
 
   return (
